@@ -67,15 +67,34 @@ function validateChallenge(response) {
 }
 
 // Validate payment requirements before the SDK creates a payment.
+
 const guardedFetch = async (input, init) => {
   const response = await fetch(input, init);
 
-  if (response.status === 402) {
+  const requestHeaders = new Headers(
+    init?.headers ??
+      (input instanceof Request ? input.headers : undefined)
+  );
+
+  const isPaymentRetry = requestHeaders.has("PAYMENT-SIGNATURE");
+
+  console.log("[Buyer debug] URL:", input);
+  console.log("[Buyer debug] Status:", response.status);
+  console.log("[Buyer debug] Payment retry:", isPaymentRetry);
+  console.log(
+    "[Buyer debug] PAYMENT-REQUIRED present:",
+    response.headers.has("PAYMENT-REQUIRED")
+  );
+
+  // Validate the original challenge before signing.
+  // Let the SDK inspect a failed payment retry's response.
+  if (response.status === 402 && !isPaymentRetry) {
     validateChallenge(response);
   }
 
   return response;
 };
+
 
 const client = new x402Client();
 
@@ -95,7 +114,6 @@ client.setSpendControls({
 });
 
 const paidFetch = wrapFetchWithPayment(guardedFetch, client);
-
 // Reusable function for the backend API.
 export async function scrapeWithPayment(url) {
   const response = await paidFetch(SELLER_URL, {
