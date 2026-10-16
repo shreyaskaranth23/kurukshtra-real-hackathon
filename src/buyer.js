@@ -9,7 +9,7 @@ import { wrapFetchWithPayment } from "@x402/fetch";
 
 const SELLER_URL = "http://localhost:3001/scrape";
 const NETWORK = "eip155:84532";
-const USDC = "0x036Cb53842c5426634e7929541eC2318f3dCF7e";
+const USDC = "0x036CbD53842c5426634e7929541eC2318f3dCF7e";
 const MAX_AMOUNT = "1000"; // 0.001 USDC, 6 decimals
 
 const buyerKey = process.env.BUYER_PRIVATE_KEY;
@@ -50,19 +50,47 @@ function validateChallenge(response) {
     throw new Error("Unsupported or invalid x402 challenge.");
   }
 
-  const match = challenge.accepts.find((payment) =>
-    payment.scheme === "exact" &&
-    payment.network === NETWORK &&
-    payment.amount === MAX_AMOUNT &&
-    payment.asset?.toLowerCase() === USDC.toLowerCase() &&
-    payment.payTo?.toLowerCase() === sellerAddress.toLowerCase()
-  );
+const payment = challenge.accepts[0];
+console.log("Asset comparison:", {
+  actual: JSON.stringify(payment.asset),
+  expected: JSON.stringify(USDC),
+  actualLength: payment.asset.length,
+  expectedLength: USDC.length,
+  actualLower: payment.asset.toLowerCase(),
+  expectedLower: USDC.toLowerCase(),
+});
 
-  if (!match) {
-    throw new Error(
-      "Payment rejected: network, amount, token, or recipient mismatch."
-    );
-  }
+console.log("Individual checks:", {
+  scheme: payment.scheme === "exact",
+  network: payment.network === NETWORK,
+  amount: payment.amount === MAX_AMOUNT,
+  asset: payment.asset?.toLowerCase() === USDC.toLowerCase(),
+  recipient:
+    payment.payTo?.toLowerCase() === sellerAddress.toLowerCase(),
+});
+
+const match = challenge.accepts.find((payment) =>
+  payment.scheme === "exact" &&
+  payment.network === NETWORK &&
+  payment.amount === MAX_AMOUNT &&
+  payment.asset?.toLowerCase() === USDC.toLowerCase() &&
+  payment.payTo?.toLowerCase() === sellerAddress.toLowerCase()
+);
+
+ if (!match) {
+  console.log("Expected:", {
+    scheme: "exact",
+    network: NETWORK,
+    amount: MAX_AMOUNT,
+    asset: USDC,
+    payTo: sellerAddress,
+  });
+
+  console.log("Received:", challenge.accepts);
+  throw new Error("Payment terms mismatch.");
+}
+
+console.log("Payment terms matched:", match);
 
   return match;
 }
