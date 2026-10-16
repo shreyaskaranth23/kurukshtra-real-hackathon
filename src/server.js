@@ -4,7 +4,7 @@ import "dotenv/config";
 import * as cheerio from "cheerio";
 import { isIP } from "node:net";
 import { agents } from "./registry.js";
-
+import { scrapeWithPayment } from "./buyer.js";
 import { paymentMiddleware } from "@x402/express";
 import {
   x402ResourceServer,
@@ -86,6 +86,38 @@ app.get("/registry", (req, res) => {
     }))
   });
 });
+
+
+app.post("/api/scrape", async (req, res) => {
+  const { url } = req.body ?? {};
+
+  if (typeof url !== "string" || url.length > 2048) {
+    return res.status(400).json({
+      error: "Provide a valid URL shorter than 2048 characters.",
+    });
+  }
+
+  try {
+    const { result, paymentResponse } =
+      await scrapeWithPayment(url);
+
+    return res.json({
+      status: "success",
+      result,
+      payment: {
+        responseHeader: paymentResponse,
+      },
+    });
+  } catch (error) {
+    console.error("Buyer request failed:", error.message);
+
+    return res.status(502).json({
+      status: "error",
+      error: error.message || "The paid scraping request failed.",
+    });
+  }
+});
+
 
 // Payment required before the scraper runs.
 app.use(
