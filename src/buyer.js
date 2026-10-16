@@ -51,7 +51,7 @@ if (!match) {
     throw new Error("Payment terms don't match expectations. No Payment made.");
 }
 
-console.log("Payment challenge validated. Proceeding to pay the seller...");
+console.log("Payment challenge validated.");
 console.log("Network:", match.network);
 console.log("Amount:0.001 testnet USDC");
 console.log("Recipent:", match.payTo);
