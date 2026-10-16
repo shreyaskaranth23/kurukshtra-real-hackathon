@@ -1,4 +1,3 @@
-
 import "dotenv/config";
 import { privateKeyToAccount } from "viem/accounts";
 import { x402Client } from "@x402/core/client";
