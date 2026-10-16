@@ -1,6 +1,9 @@
 
 import express from "express";
 import "dotenv/config";
+import * as cheerio from "cheerio";
+import { isIP } from "node:net";
+import { agents } from "./registry.js";
 
 import { paymentMiddleware } from "@x402/express";
 import {
@@ -19,15 +22,51 @@ if (!payTo || !/^0x[a-fA-F0-9]{40}$/.test(payTo)) {
   );
 }
 
-app.use(express.json());
+app.use(express.json({ limit: "10kb" }));
 
 const facilitator = new HTTPFacilitatorClient({
   url: "https://x402.org/facilitator",
 });
 
 const server = new x402ResourceServer(facilitator);
-
 registerExactEvmScheme(server);
+
+// Reject obvious local/private destinations.
+function validateUrl(value) {
+  let parsed;
+
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("Please provide a valid URL.");
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new Error("Only HTTPS URLs are allowed.");
+  }
+
+  if (
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hostname === "localhost" ||
+    parsed.hostname.endsWith(".localhost") ||
+    parsed.hostname.endsWith(".local") ||
+    parsed.hostname === "[::1]" ||
+    parsed.hostname === "0.0.0.0"
+  ) {
+    throw new Error("This destination is not allowed.");
+  }
+
+  // Reject literal IP addresses for this MVP.
+  // A production scraper should also resolve DNS and block
+  // private/reserved IPs, including after every redirect.
+  if (isIP(parsed.hostname.replace(/^\[|\]$/g, ""))) {
+    throw new Error("IP-address URLs are not allowed.");
+  }
+
+  return parsed;
+}
 
 // Health check — no payment required.
 app.get("/health", (req, res) => {
@@ -38,7 +77,17 @@ app.get("/health", (req, res) => {
   });
 });
 
-// Require x402 payment before accessing this endpoint.
+ // Public service discovery — no payment required.
+app.get("/registry", (req, res) => {
+  res.json({
+    agents: agents.map(({ payToEnv, ...agent }) => ({
+      ...agent,
+      payTo: process.env[payToEnv] ?? null
+    }))
+  });
+});
+
+// Payment required before the scraper runs.
 app.use(
   paymentMiddleware(
     {
@@ -59,25 +108,125 @@ app.use(
   )
 );
 
-// Temporary demo response — actual scraping comes later.
-app.post("/scrape", (req, res) => {
-  const { url } = req.body ?? {};
+app.post("/scrape", async (req, res) => {
+  try {
+    const { url } = req.body ?? {};
 
-  if (typeof url !== "string" || !url.startsWith("https://")) {
-    return res.status(400).json({
-      error: "Please provide a valid HTTPS URL.",
+    if (typeof url !== "string" || url.length > 2048) {
+      return res.status(400).json({
+        error: "Provide a URL shorter than 2048 characters.",
+      });
+    }
+
+    const parsedUrl = validateUrl(url);
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+
+    let response;
+
+    try {
+      response = await fetch(parsedUrl, {
+        method: "GET",
+        redirect: "error",
+        signal: controller.signal,
+        headers: {
+          "User-Agent": "AgentEconomyScraper/1.0",
+          Accept: "text/html",
+        },
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    if (!response.ok) {
+      return res.status(502).json({
+        error: `Target webpage returned HTTP ${response.status}.`,
+      });
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+
+    if (!contentType.includes("text/html")) {
+      return res.status(415).json({
+        error: "The target URL did not return HTML.",
+      });
+    }
+
+    const html = await response.text();
+
+    if (Buffer.byteLength(html, "utf8") > 2_000_000) {
+      return res.status(413).json({
+        error: "Target webpage is too large to process.",
+      });
+    }
+
+    const $ = cheerio.load(html);
+
+    $("script, style, noscript, iframe, svg").remove();
+
+    const title = $("title").first().text().trim();
+    const description =
+      $('meta[name="description"]').attr("content")?.trim() || "";
+
+    const headings = $("h1, h2")
+      .map((_, element) => $(element).text().trim())
+      .get()
+      .filter(Boolean)
+      .slice(0, 20);
+
+    const text = $("body")
+      .text()
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 10000);
+
+    const links = $("a[href]")
+      .map((_, element) => {
+        const href = $(element).attr("href");
+        const label = $(element).text().trim();
+
+        try {
+          const absoluteUrl = new URL(href, parsedUrl).href;
+
+          if (
+            new URL(absoluteUrl).protocol === "https:" &&
+            label
+          ) {
+            return { label: label.slice(0, 200), url: absoluteUrl };
+          }
+        } catch {
+          // Skip malformed links.
+        }
+
+        return null;
+      })
+      .get()
+      .filter(Boolean)
+      .slice(0, 20);
+
+    return res.json({
+      service: "web-scraper-agent",
+      url: parsedUrl.href,
+      title,
+      description,
+      headings,
+      text,
+      links,
+      scrapedAt: new Date().toISOString(),
+    });
+  } catch (error) {
+    const timedOut = error.name === "AbortError";
+
+    return res.status(timedOut ? 504 : 502).json({
+      error: timedOut
+        ? "The target webpage timed out."
+        : error.message || "Scraping failed.",
     });
   }
-
-  res.json({
-    service: "web-scraper-agent",
-    url,
-    result: "Paid endpoint reached successfully.",
-  });
 });
 
-app.listen(PORT, () => {
-  console.log(`Seller agent running at http://localhost:${PORT}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Seller agent listening on port ${PORT}`);
   console.log("Payment network: Base Sepolia");
-  console.log("Price: 0.001 testnet USDC per request");
 });
