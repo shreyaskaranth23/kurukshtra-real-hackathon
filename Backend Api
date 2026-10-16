@@ -1,0 +1,114 @@
+import 'dotenv/config';
+import express from 'express';
+import cors from 'cors';
+import initSqlJs from 'sql.js';
+import { z } from 'zod';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { paymentMiddleware, x402ResourceServer } from '@x402/express';
+import { ExactEvmScheme } from '@x402/evm/exact/server';
+import { ExactEvmScheme as ExactEvmClientScheme } from '@x402/evm/exact/client';
+import { HTTPFacilitatorClient } from '@x402/core/server';
+import { x402Client, x402HTTPClient } from '@x402/core/client';
+import { wrapFetchWithPayment } from '@x402/fetch';
+import { privateKeyToAccount } from 'viem/accounts';
+import { isAddress } from 'viem';
+
+const app = express();
+app.use(cors()); app.use(express.json({limit:'32kb'}));
+const dbFile = resolve(process.env.DATABASE_PATH || './data/agentxchange.sqlite'); mkdirSync(dirname(dbFile),{recursive:true});
+const SQL = await initSqlJs();
+const rawDb = new SQL.Database(existsSync(dbFile) ? new Uint8Array(readFileSync(dbFile)) : undefined);
+const saveDb=()=>writeFileSync(dbFile,Buffer.from(rawDb.export()));
+const db={exec:(sql:string)=>{rawDb.exec(sql);saveDb();},prepare:(sql:string)=>({
+ run:(...params:any[])=>{rawDb.run(sql,params);const id=rawDb.exec('SELECT last_insert_rowid() AS id')[0]?.values[0]?.[0];saveDb();return {lastInsertRowid:Number(id||0)};},
+ all:(...params:any[])=>{const s=rawDb.prepare(sql);s.bind(params);const out:any[]=[];while(s.step())out.push(s.getAsObject());s.free();return out;},
+ get:(...params:any[])=>{const s=rawDb.prepare(sql);s.bind(params);const out=s.step()?s.getAsObject():undefined;s.free();return out;}
+})};
+db.exec(`CREATE TABLE IF NOT EXISTS agents(id TEXT PRIMARY KEY,name TEXT,category TEXT,description TEXT,price REAL,network TEXT,pay_to TEXT,input_schema TEXT,output_schema TEXT,enabled INTEGER);
+CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY AUTOINCREMENT,task TEXT,budget REAL,spent REAL,mode TEXT,status TEXT,created_at TEXT);
+CREATE TABLE IF NOT EXISTS calls(id INTEGER PRIMARY KEY AUTOINCREMENT,run_id INTEGER,agent_id TEXT,status TEXT,latency_ms INTEGER,amount REAL,tx_hash TEXT,created_at TEXT);`);
+const seeds = [
+ ['atlas-scraper','Atlas Scraper','Scraping','Extracts structured product data and descriptions from approved public pages.',0.002,'eip155:84532',process.env.SCRAPER_PAY_TO||'','{"url":"books.toscrape.com","pages":"1-4"}','{"books":"Book[] (includes description)","source":"string"}',1],
+ ['currency-oracle','Currency Oracle','Data','Returns current FX rates with a timestamp and source.',0.001,'eip155:84532',process.env.DATA_PAY_TO||'','{"base":"USD","quote":"INR"}','{"rate":"number (USD/INR)","gbpToInr":"number","date":"string","source":"string"}',1],
+ ['hindi-scribe','Hindi Scribe','Inference','Writes a concise Hindi summary from supplied structured research.',0.004,'eip155:84532',process.env.INFERENCE_PAY_TO||'','{"text":"string","language":"Hindi"}','{"summary":"string","provider":"string"}',1],
+];
+const putAgent=db.prepare('INSERT OR IGNORE INTO agents VALUES(?,?,?,?,?,?,?,?,?,?)'); for(const a of seeds) putAgent.run(...a);
+for(const a of seeds)db.prepare('UPDATE agents SET pay_to=?,description=?,output_schema=? WHERE id=?').run(a[6],a[3],a[8],a[0]);
+const agentRows=()=>db.prepare('SELECT * FROM agents ORDER BY category,name').all() as any[];
+const callCounts=()=>{const result:Record<string,any>={};for(const id of ['atlas-scraper','currency-oracle','hindi-scribe']){const calls=db.prepare('SELECT status,latency_ms FROM calls WHERE agent_id=? ORDER BY latency_ms').all(id) as any[];const succeeded=calls.filter(x=>x.status==='success');const times=succeeded.map(x=>x.latency_ms).sort((a,b)=>a-b);result[id]={n:calls.length,ok:succeeded.length,latency:times.length?(times.length%2?times[(times.length-1)/2]:(times[times.length/2-1]+times[times.length/2])/2):0};}return result;};
+const priceCalls=db.prepare('INSERT INTO calls(run_id,agent_id,status,latency_ms,amount,tx_hash,created_at) VALUES(?,?,?,?,?,?,?)');
+const maxRunBudget=Math.min(100,Math.max(0.001,Number(process.env.MAX_RUN_BUDGET||0.02)));
+const maxDailySpend=Math.min(100,Math.max(maxRunBudget,Number(process.env.MAX_DAILY_SPEND||0.05)));
+const validRun=z.object({task:z.string().min(8).max(1500),budget:z.number().positive().max(maxRunBudget)});
+const BASE='https://books.toscrape.com/catalogue/page-';
+const decodeHtml=(value:string)=>value.replace(/&#(\d+);/g,(_m,n)=>String.fromCodePoint(Number(n))).replace(/&#x([\da-f]+);/gi,(_m,n)=>String.fromCodePoint(parseInt(n,16))).replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&apos;|&#39;/g,"'").replace(/&nbsp;/g,' ');
+async function scrapeBooks(pages=4,count=3){
+ const books:any[]=[];
+ for(let p=1;p<=Math.min(4,Math.max(1,pages));p++){
+  const pageUrl=`${BASE}${p}.html`;const r=await fetch(pageUrl,{headers:{'User-Agent':'AgentXchange research prototype (public demo)'}}); if(!r.ok) throw new Error(`Books demo source returned ${r.status}`); const html=await r.text();
+  const items=html.split('<article class="product_pod">').slice(1);
+  for(const item of items){const title=decodeHtml((item.match(/title="([^"]+)"/)||[])[1]||''); const price=(item.match(/class="price_color">([^<]+)/)||[])[1]||''; const rating=(item.match(/star-rating ([A-Za-z]+)/)||[])[1]||'';const href=(item.match(/<h3><a href="([^"]+)"/)||[])[1]; if(title&&href) books.push({title,price,rating,url:new URL(href,pageUrl).toString()});}
+ }
+ const chosen=books.filter(b=>b.rating==='Five').sort((x,y)=>parseFloat(x.price.replace('£',''))-parseFloat(y.price.replace('£',''))).slice(0,Math.min(3,Math.max(1,count)));
+ return Promise.all(chosen.map(async book=>{const url=new URL(book.url);if(url.hostname!=='books.toscrape.com')throw new Error('Scraper blocked a link outside the approved Books to Scrape host');const response=await fetch(url,{headers:{'User-Agent':'AgentXchange research prototype (public demo)'}});if(!response.ok)throw new Error(`Book details returned ${response.status}`);const html=await response.text();const marker=html.indexOf('id="product_description"');const paragraphStart=marker<0?-1:html.indexOf('<p>',marker);const paragraphEnd=paragraphStart<0?-1:html.indexOf('</p>',paragraphStart);let raw=paragraphStart>=0&&paragraphEnd>paragraphStart?html.slice(paragraphStart+3,paragraphEnd):'';const firstSentence=raw.match(/^(.{80,240}?[.!?])(?:\s|[A-Z])/);if(firstSentence){const duplicate=raw.indexOf(firstSentence[1],firstSentence[1].length);if(duplicate>0&&duplicate<260)raw=raw.slice(0,duplicate)+raw.slice(duplicate+firstSentence[1].length);}const description=decodeHtml(raw.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim())||'No description published.';return {title:book.title,price:book.price,rating:book.rating,description};}));
+}
+function planResearchTask(task:string){const value=task.toLowerCase();const categories:string[]=[];if(/book|scrap|catalog|books\.toscrape/.test(value))categories.push('Scraping');if(/convert|currency|exchange|inr|rate|price/.test(value))categories.push('Data');if(/summar|hindi|translate/.test(value))categories.push('Inference');if(categories.length!==3)return null;const pagesMatch=value.match(/pages?\s*(\d+)\s*(?:to|-)\s*(\d+)/);const pages=pagesMatch?Math.max(1,Math.min(4,Number(pagesMatch[2]))):4;const countMatch=value.match(/\b(three|3|two|2|one|1)\s+(?:cheapest|books|results|items)\b/);const count=countMatch?({three:3,'3':3,two:2,'2':2,one:1,'1':1} as Record<string,number>)[countMatch[1]]:3;return {categories,pages,count};}
+async function getRate(){ const r=await fetch('https://open.er-api.com/v6/latest/USD'); if(!r.ok) throw new Error('Exchange rate source unavailable'); const data:any=await r.json(); return {rate:data.rates?.INR,gbpToInr:data.rates?.INR/data.rates?.GBP,date:data.time_last_update_utc,source:'open.er-api.com'}; }
+async function summarize(text:string){
+ if(process.env.OPENAI_API_KEY){const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:process.env.OPENAI_MODEL||'gpt-4o-mini',messages:[{role:'system',content:'Write a concise Hindi summary. Do not invent facts. Mention this is a summary of book titles, prices and ratings.'},{role:'user',content:text}],temperature:0.3})});if(!r.ok)throw new Error('Configured summarization provider failed');const d:any=await r.json();return {summary:d.choices?.[0]?.message?.content||'',provider:process.env.OPENAI_MODEL||'OpenAI model'};}
+ const entries=text.split('\n').map(line=>{const [titlePart,...descriptionParts]=line.split('Description:');return {book:titlePart.trim(),description:(descriptionParts.join('Description:').trim().split(/(?<=[.!?])\s/)[0]||'').slice(0,220)};});const excerpts=entries.map(e=>`${e.book}: “${e.description}”`).join(' ');return {summary:`तीन चुनी हुई पाँच-सितारा पुस्तकों के विवरणों से मुख्य अंश: ${excerpts}। ये मूल विवरणों के अंश हैं; यह निर्धारित डेमो सारांश है, AI मॉडल का उत्तर नहीं।`,provider:'Deterministic extractive demo fallback (no AI inference)'};
+}
+app.get('/api/health',(_req,res)=>res.json({ok:true,mode:process.env.MODE==='live'?'live':'demo',network:'Base Sepolia',x402Configured:liveConfigured}));
+app.get('/api/agents',(_req,res)=>{const counts=callCounts();res.json(agentRows().map(a=>{const c=counts[a.id]||{n:0,ok:0,latency:0};const {pay_to,input_schema,output_schema,enabled,...publicAgent}=a;return {...publicAgent,payTo:pay_to||null,inputSchema:JSON.parse(input_schema),outputSchema:JSON.parse(output_schema),availability:enabled?'Available':'Unavailable',x402Configured:liveConfigured&&Boolean(pay_to),completed:c.ok,successRate:c.n?Math.round(c.ok/c.n*100):null,medianMs:c.ok?Math.max(1,Math.round(c.latency)):null};}));});
+app.get('/api/stats',(_req,res)=>{const runs:any=db.prepare('SELECT COUNT(*) runs FROM runs').get();const calls:any=db.prepare('SELECT COUNT(*) calls,COALESCE(SUM(CASE WHEN tx_hash IS NOT NULL THEN amount ELSE 0 END),0) spend FROM calls').get();const tx:any=db.prepare('SELECT COUNT(*) n FROM calls WHERE tx_hash IS NOT NULL').get();res.json({runs:runs.runs,calls:calls.calls,settledPayments:tx.n,recordedSpend:Number(calls.spend)});});
+app.get('/api/activity',(_req,res)=>res.json(db.prepare('SELECT c.*,a.name agent_name FROM calls c JOIN agents a ON a.id=c.agent_id ORDER BY c.id DESC LIMIT 15').all()));
+
+const payout = {scrape:process.env.SCRAPER_PAY_TO||'',data:process.env.DATA_PAY_TO||'',inference:process.env.INFERENCE_PAY_TO||''};
+const liveToken=process.env.LIVE_RUN_TOKEN||'';
+const liveConfigured = Boolean(process.env.MODE==='live' && process.env.EVM_PRIVATE_KEY && liveToken.length>=24 && Object.values(payout).every(address=>isAddress(address)));
+if(liveConfigured){
+ const facilitator=new HTTPFacilitatorClient({url:process.env.FACILITATOR_URL||'https://x402.org/facilitator'});
+ const resourceServer=new x402ResourceServer(facilitator).register('eip155:84532',new ExactEvmScheme());
+ const protectedRoutes:any={};
+ for(const [path,recipient,price,description] of [
+  ['/api/paid/scrape',payout.scrape,'$0.002','Scrape public Books to Scrape catalog pages'],
+  ['/api/paid/data',payout.data,'$0.001','Retrieve the current USD to INR exchange rate'],
+  ['/api/paid/inference',payout.inference,'$0.004','Generate a Hindi research summary'],
+ ] as const) protectedRoutes[`POST ${path}`]={accepts:[{scheme:'exact',price,network:'eip155:84532',payTo:recipient}],description};
+ app.use(paymentMiddleware(protectedRoutes,resourceServer));
+}
+if(!liveConfigured)app.use('/api/paid',(_req,res)=>res.status(503).json({error:'Live seller endpoints are disabled. Configure MODE=live, all three Base Sepolia payout addresses, a dedicated testnet buyer key, and a live run token.'}));
+app.post('/api/paid/scrape',async(req,res)=>{try{const parsed=z.object({pages:z.number().int().min(1).max(4),count:z.number().int().min(1).max(3)}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Page range must stay within four pages and result count within three'});const books=await scrapeBooks(parsed.data.pages,parsed.data.count);res.json({books,source:'books.toscrape.com'});}catch(e){res.status(502).json({error:e instanceof Error?e.message:'Scraping failed'});}});
+app.post('/api/paid/data',async(_req,res)=>{try{res.json(await getRate());}catch(e){res.status(502).json({error:e instanceof Error?e.message:'Data request failed'});}});
+app.post('/api/paid/inference',async(req,res)=>{try{const parsed=z.object({text:z.string().min(1).max(8000)}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Invalid summarization input'});res.json(await summarize(parsed.data.text));}catch(e){res.status(502).json({error:e instanceof Error?e.message:'Summary failed'});}});
+app.post('/api/run',async(req,res)=>{
+ const mode=process.env.MODE==='live'?'live':'demo';
+ if(mode==='live'&&liveConfigured&&req.get('x-scout-token')!==liveToken)return res.status(401).json({error:'Live run token is missing or incorrect. Add the operator token to authorize this task.'});
+ const parsed=validRun.safeParse(req.body);if(!parsed.success)return res.status(400).json({error:parsed.error.issues[0]?.message||'Invalid task'});
+ const {task,budget}=parsed.data;const plan=planResearchTask(task);if(!plan)return res.status(400).json({error:'This prototype supports a Books to Scrape research task with price conversion and a Hindi summary. Use or adapt the sample prompt.'});const registry=agentRows();const selectedAgents=plan.categories.map(category=>registry.filter(a=>a.category===category).sort((x,y)=>(y.successRate??0)-(x.successRate??0)||x.price-y.price||(x.medianMs??Infinity)-(y.medianMs??Infinity))[0]).filter(Boolean);const selectedPrice=selectedAgents.reduce((sum,a)=>sum+a.price,0);const estimate=selectedPrice;const a=selectedAgents;
+ const runInfo={selected:a.map(x=>({id:x.id,name:x.name,price:x.price,category:x.category,reason:`Chosen by comparing recorded success rate, quote, and response time in the ${x.category.toLowerCase()} category; ${x.price} USDC per request.`})),estimate,mode};
+ if(estimate>budget)return res.status(402).json({error:`Estimated cost $${estimate.toFixed(3)} exceeds your $${budget.toFixed(3)} budget. No services were called.`,...runInfo});
+ if(mode==='live'&&!liveConfigured)return res.status(503).json({error:'Live x402 is not configured. Add three Base Sepolia payout addresses and a dedicated testnet buyer key; no payments were sent.',...runInfo});
+ if(mode==='live'){const today=new Date().toISOString().slice(0,10);const prior:any=db.prepare('SELECT COALESCE(SUM(amount),0) spend FROM calls WHERE tx_hash IS NOT NULL AND substr(created_at,1,10)=?').get(today);if(Number(prior.spend)+estimate>maxDailySpend)return res.status(429).json({error:`Daily testnet spend cap reached. Remaining today: $${Math.max(0,maxDailySpend-Number(prior.spend)).toFixed(3)} USDC. No service requests were sent.` ,...runInfo});}
+ const started=new Date().toISOString();const runId=Number(db.prepare('INSERT INTO runs(task,budget,spent,mode,status,created_at) VALUES(?,?,?,?,?,?)').run(task,budget,0,mode,'running',started).lastInsertRowid);
+ const events:any[]=[];const log=(stage:string,message:string)=>events.push({stage,message,at:new Date().toISOString()});
+ try{
+  log('received','Task received by Scout');log('planning',`Identified service categories: ${plan.categories.join(', ')}; selected ${plan.count} books from pages 1–${plan.pages}`);log('registry',`Searched ${registry.length} registered agents and selected the lowest quoted seller in each required category`);log('budget',`Budget check passed — estimated ${estimate.toFixed(3)} USDC; ${mode==='demo'?'demo mode makes no payment':'live mode will settle each call separately'}`);
+  let paidFetch:typeof fetch|undefined;let paymentClient:x402HTTPClient|undefined;
+  if(mode==='live'){const account=privateKeyToAccount(process.env.EVM_PRIVATE_KEY as `0x${string}`);const xclient=new x402Client().register('eip155:84532',new ExactEvmClientScheme(account));paidFetch=wrapFetchWithPayment(fetch,xclient);paymentClient=new x402HTTPClient(xclient);}
+  const paidPost=async<T>(endpoint:string,agentId:string,body:unknown,quote:number)=>{const t=Date.now();let r:Response;try{r=await (paidFetch||fetch)(`http://127.0.0.1:${port}/api/paid/${endpoint}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});}catch(e){priceCalls.run(runId,agentId,'failed',Date.now()-t,0,null,new Date().toISOString());throw e;}const settlement=paymentClient?.getPaymentSettleResponse(name=>r.headers.get(name));const txHash=settlement?.success?settlement.transaction:null;if(!r.ok){priceCalls.run(runId,agentId,'failed',Date.now()-t,txHash?quote:0,txHash,new Date().toISOString());throw new Error(`Seller ${endpoint} request failed (${r.status}): ${await r.text()}`);}const value=await r.json() as T;if(mode==='live'&&!settlement?.success){priceCalls.run(runId,agentId,'failed',Date.now()-t,0,null,new Date().toISOString());throw new Error(`x402 settlement not confirmed for ${endpoint}; the service response was not recorded as paid`);}priceCalls.run(runId,agentId,'success',Date.now()-t,mode==='live'?quote:0,txHash,new Date().toISOString());return value;};
+  const zBooks=z.array(z.object({title:z.string(),price:z.string(),rating:z.string(),description:z.string()}));
+  const s1=Date.now();const scraped=mode==='live'?await paidPost<{books:unknown}>('scrape','atlas-scraper',{pages:plan.pages,count:plan.count},0.002):{books:await scrapeBooks(plan.pages,plan.count)};const selected=zBooks.parse(scraped.books) as any[];const scrapMs=Date.now()-s1;
+  if(!selected.length) throw new Error('No five-star books found in the selected pages');log('scrape',`Atlas Scraper returned ${selected.length} five-star books with descriptions from Books to Scrape`);if(mode==='demo')priceCalls.run(runId,'atlas-scraper','success',scrapMs,0,null,new Date().toISOString());
+  const d1=Date.now();const fx=mode==='live'?await paidPost<{rate:number;gbpToInr:number;date:string;source:string}>('data','currency-oracle',{},0.001):await getRate();const fxData=z.object({rate:z.number().positive(),gbpToInr:z.number().positive(),date:z.string(),source:z.string()}).parse(fx);if(!Number.isFinite(fxData.rate))throw new Error('Exchange rate response did not contain INR');for(const book of selected){const gbp=parseFloat(book.price.replace('£',''));(book as any).priceINR=Math.round(gbp*fxData.gbpToInr);}const dataMs=Date.now()-d1;log('data',`Currency Oracle returned USD/INR ${Number(fxData.rate).toFixed(2)} and GBP/INR ${Number(fxData.gbpToInr).toFixed(2)}`);if(mode==='demo')priceCalls.run(runId,'currency-oracle','success',dataMs,0,null,new Date().toISOString());
+  const i1=Date.now();const input=selected.map(b=>`${b.title} — ${b.price}, ${b.rating} stars. Description: ${b.description}`).join('\n');const result=mode==='live'?await paidPost<{summary:string;provider:string}>('inference','hindi-scribe',{text:input},0.004):await summarize(input);const inferMs=Date.now()-i1;const summaryData=z.object({summary:z.string(),provider:z.string()}).parse(result);log('inference',`Hindi Scribe completed using ${summaryData.provider}`);if(mode==='demo')priceCalls.run(runId,'hindi-scribe','success',inferMs,0,null,new Date().toISOString());
+  log('validation','Validated structured service responses');log('complete','Research report ready');db.prepare('UPDATE runs SET status=? WHERE id=?').run('success',runId);
+  const spent:any=db.prepare('SELECT COALESCE(SUM(CASE WHEN tx_hash IS NOT NULL THEN amount ELSE 0 END),0) amount FROM calls WHERE run_id=?').get(runId);const spend=Number(spent.amount);db.prepare('UPDATE runs SET spent=?,status=? WHERE id=?').run(spend,'success',runId);
+  res.json({id:runId,...runInfo,paid:mode==='live',paymentNote:mode==='live'?'x402 exact payments settled on Base Sepolia for each successful service request.':'Demo mode: no x402 request or blockchain payment was made. Displayed prices are registry quotes only.',books:selected,exchangeRate:fxData,summarizer:summaryData.provider,summary:summaryData.summary,events});
+ }catch(e){const spent:any=db.prepare('SELECT COALESCE(SUM(CASE WHEN tx_hash IS NOT NULL THEN amount ELSE 0 END),0) amount FROM calls WHERE run_id=?').get(runId);db.prepare('UPDATE runs SET spent=?,status=? WHERE id=?').run(Number(spent.amount),'failed',runId);res.status(502).json({error:e instanceof Error?e.message:'Research run failed',events,mode,paid:Number(spent.amount)>0,spent:Number(spent.amount)});}
+});
+const port=Number(process.env.PORT||3001);
+const dist=resolve('./dist');
+if(existsSync(dist)){app.use(express.static(dist));app.get(/.*/,(req,res,next)=>req.path.startsWith('/api/')?next():res.sendFile(resolve(dist,'index.html')));}
+app.listen(port,'0.0.0.0',()=>console.log(`AgentXchange API listening on ${port} (${process.env.MODE||'demo'} mode; Base Sepolia target)`));
