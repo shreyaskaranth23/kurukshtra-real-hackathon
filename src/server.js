@@ -6,6 +6,7 @@ import { isIP } from "node:net";
 import { agents } from "./registry.js";
 import { scrapeWithPayment } from "./buyer.js";
 import { paymentMiddleware } from "@x402/express";
+import { extractStructuredData } from "./extractor.js";
 import {
   x402ResourceServer,
   HTTPFacilitatorClient,
@@ -254,6 +255,62 @@ app.post("/scrape", async (req, res) => {
       error: timedOut
         ? "The target webpage timed out."
         : error.message || "Scraping failed.",
+    });
+  }
+});
+
+
+app.post("/api/extract", async (req, res) => {
+  const { data } = req.body ?? {};
+
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    return res.status(400).json({
+      status: "error",
+      error: "Provide scraped webpage data as an object in the 'data' field.",
+    });
+  }
+
+  try {
+    const result = extractStructuredData(data);
+
+    return res.json({
+      status: "success",
+      result,
+    });
+  } catch (error) {
+    return res.status(400).json({
+      status: "error",
+      error: error.message || "Extraction failed.",
+    });
+  }
+});
+
+
+app.post("/api/scrape-and-extract", async (req, res) => {
+  const { url } = req.body ?? {};
+
+  if (typeof url !== "string" || url.length > 2048) {
+    return res.status(400).json({
+      status: "error",
+      error: "Provide a valid URL shorter than 2048 characters.",
+    });
+  }
+
+  try {
+    const { result: scraped } = await scrapeWithPayment(url);
+    const extracted = extractStructuredData(scraped);
+
+    return res.json({
+      status: "success",
+      scraped,
+      extracted,
+    });
+  } catch (error) {
+    console.error("Scrape-and-extract failed:", error.message);
+
+    return res.status(502).json({
+      status: "error",
+      error: error.message || "Scraping and extraction failed.",
     });
   }
 });
